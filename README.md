@@ -29,44 +29,46 @@ cd top-process-exporter
 docker-compose up -d
 ```
 
-The exporter will be available at http://localhost:9256/metrics
+The exporter will be available at http://localhost:9258/metrics
 
 ### Using Docker Directly
 
 ```bash
-# Build the image
-docker build -t top-process-exporter .
+# Pull the image
+docker pull davidmbl/top-process-exporter:latest
 
 # Run the container
 docker run -d \
   --name top-process-exporter \
-  -p 9256:8000 \
+  -p 9258:8000 \
   -e TOP_N=100 \
   -e CACHE_SECONDS=10 \
   --pid=host \
   --privileged \
-  top-process-exporter
+  davidmbl/top-process-exporter:latest
 ```
 
-### Using Python Directly
+### Building and Running with Go
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
+# Download dependencies
+go mod download
 
-# Run the exporter
-python exporter.py
+# Build and run
+go build -o top-process-exporter .
+./top-process-exporter
 ```
 
 ## Configuration
 
-Configuration is done via environment variables:
+Configuration is done via environment variables or command-line flags:
 
-| Variable | Description | Default |
-|----------|-------------|---------|
-| TOP_N | Number of top processes to expose | 100 |
-| CACHE_SECONDS | Time to cache results (in seconds) | 10 |
-| PORT | Port to expose the HTTP server on | 8000 |
+| Variable/Flag | Description | Default |
+|---------------|-------------|---------|
+| TOP_N / --topn | Number of top processes to expose | 100 |
+| CACHE_SECONDS / --cache | Time to cache results (in seconds) | 10 |
+| PORT / --port | Port to expose the HTTP server on | 8000 |
+| METRICS_PATH / --metrics-path | Path to expose metrics on | /metrics |
 
 ## Endpoints
 
@@ -82,7 +84,7 @@ Add the following to your `prometheus.yml`:
 scrape_configs:
   - job_name: 'top-process-exporter'
     static_configs:
-      - targets: ['localhost:9256']
+      - targets: ['localhost:9258']
     scrape_interval: 15s
 ```
 
@@ -107,6 +109,16 @@ This exporter requires privileged access to gather process information from the 
 1. Running the container with the minimum required privileges
 2. Implementing proper network security to restrict access to the exporter
 3. Reviewing the access requirements regularly
+
+## Implementation
+
+This exporter is implemented in Go for several reasons:
+
+1. **Cross-platform compatibility**: Single binary works on all platforms
+2. **No runtime dependencies**: Avoid library compatibility issues
+3. **Performance**: Efficient for collecting system metrics
+4. **Small footprint**: Minimal resource usage
+5. **Native Prometheus support**: First-class Prometheus client library
 
 ## Grafana Dashboard
 

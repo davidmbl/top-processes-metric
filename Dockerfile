@@ -1,41 +1,36 @@
-FROM --platform=$BUILDPLATFORM python:3.12-alpine as builder
+# Build stage
+FROM golang:1.22-alpine AS builder
 
 # Install build dependencies
-RUN apk add --no-cache --virtual .build-deps \
-    gcc \
-    musl-dev \
-    python3-dev \
-    linux-headers
+RUN apk add --no-cache git
 
-# Create virtual environment
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-FROM --platform=$TARGETPLATFORM python:3.12-alpine
-
-# Copy virtual environment from builder
-COPY --from=builder /opt/venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Create non-root user
-RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 WORKDIR /app
 
-# Copy application
-COPY exporter.py /app/
-RUN chmod +x /app/exporter.py
+# Copy go module files and source code
+COPY go.mod main.go ./
+
+# Get dependencies and build
+RUN go mod tidy && \
+    go get -d -v && \
+    go build -o top-process-exporter .
+
+# Final stage
+FROM alpine:latest
+
+# Install necessary dependencies for health checks
+RUN apk --no-cache add ca-certificates wget
+
+WORKDIR /app
+
+# Copy the binary from the builder stage
+COPY --from=builder /app/top-process-exporter .
 
 # Metadata
 LABEL maintainer="top-services-project"
 LABEL version="1.0.0"
 LABEL description="Prometheus exporter for top CPU and memory processes"
 
-# Configure container
-USER appuser
+# Expose the port
 EXPOSE 8000
 
 # Health check
@@ -47,5 +42,5 @@ ENV TOP_N=100
 ENV CACHE_SECONDS=10
 ENV PORT=8000
 
-# Run the exporter
-CMD ["python", "/app/exporter.py"] 
+# Run the application
+CMD ["./top-process-exporter"] 
