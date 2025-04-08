@@ -7,7 +7,9 @@ A self-contained Prometheus exporter that collects information about top CPU and
 - **Standalone**: No external dependencies (like cron, node_exporter, etc.)
 - **Prometheus-ready**: Exposes metrics in Prometheus format at `/metrics` endpoint
 - **Docker-based**: Easy to deploy with Docker or Docker Compose
+- **Multi-platform**: Supports both ARM64 (Apple Silicon) and AMD64 architectures
 - **Resource-efficient**: Caches results to reduce system impact
+- **Optimized**: Designed to minimize CPU spikes during collection
 - **Detailed metrics**: Provides extensive process information including:
   - CPU usage percentage
   - Memory usage (percentage and bytes)
@@ -41,8 +43,9 @@ docker pull davidmbl/top-process-exporter:latest
 docker run -d \
   --name top-process-exporter \
   -p 9258:8000 \
-  -e TOP_N=100 \
-  -e CACHE_SECONDS=10 \
+  -e TOP_N=30 \
+  -e CACHE_SECONDS=20 \
+  -e MAX_CONCURRENT=2 \
   --pid=host \
   --privileged \
   davidmbl/top-process-exporter:latest
@@ -65,10 +68,38 @@ Configuration is done via environment variables or command-line flags:
 
 | Variable/Flag | Description | Default |
 |---------------|-------------|---------|
-| TOP_N / --topn | Number of top processes to expose | 100 |
-| CACHE_SECONDS / --cache | Time to cache results (in seconds) | 10 |
+| TOP_N / --topn | Number of top processes to expose | 30 |
+| CACHE_SECONDS / --cache | Time to cache results (in seconds) | 20 |
 | PORT / --port | Port to expose the HTTP server on | 8000 |
 | METRICS_PATH / --metrics-path | Path to expose metrics on | /metrics |
+| MAX_CONCURRENT / --max-concurrent | Maximum concurrent scrape requests allowed | 2 |
+
+## Building Multi-platform Docker Images
+
+This project includes tools to easily build multi-platform Docker images:
+
+### Using the build script:
+
+```bash
+# Build latest version
+./build.sh
+
+# Build specific version
+./build.sh v1.0.0
+```
+
+### Using Make:
+
+```bash
+# Build latest multi-platform image
+make build-multi
+
+# Build specific version
+make build-multi VERSION=v1.0.0
+
+# See all available commands
+make help
+```
 
 ## Endpoints
 
@@ -101,6 +132,15 @@ top_process_memory{name="chrome", pid="1234", user="john"} 15.2
 # TYPE top_process_memory_bytes gauge
 top_process_memory_bytes{name="chrome", pid="1234", user="john"} 1234567890
 ```
+
+## Performance Considerations
+
+This exporter is optimized to minimize CPU spikes:
+
+1. **Two-phase collection**: Quick filtering followed by detailed metrics only for promising processes
+2. **Controlled concurrency**: Limits both the process collection goroutines and concurrent scrape requests
+3. **Smart caching**: Cached results are served immediately when a collection is in progress
+4. **Configurable cache time**: Adjust based on your needs (20 seconds by default)
 
 ## Security Considerations
 
