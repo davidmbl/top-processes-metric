@@ -22,22 +22,25 @@ type Config struct {
 	TopN        int
 	CacheTime   int
 	MetricsPath string
+	MaxConcurrent int
 }
 
 // Process metrics collector
 type ProcessCollector struct {
-	mutex       sync.RWMutex
-	topN        int
-	lastCollect time.Time
-	cacheTime   int
-	cpuDesc     *prometheus.Desc
-	memPercDesc *prometheus.Desc
-	memBytesDesc *prometheus.Desc
-	threadDesc  *prometheus.Desc
-	uptimeDesc  *prometheus.Desc
+	mutex         sync.RWMutex
+	topN          int
+	lastCollect   time.Time
+	cacheTime     int
+	cpuDesc       *prometheus.Desc
+	memPercDesc   *prometheus.Desc
+	memBytesDesc  *prometheus.Desc
+	threadDesc    *prometheus.Desc
+	uptimeDesc    *prometheus.Desc
 	cpuSystemDesc *prometheus.Desc
-	cpuUserDesc *prometheus.Desc
-	processes   []ProcessInfo
+	cpuUserDesc   *prometheus.Desc
+	processes     []ProcessInfo
+	collecting    bool
+	collectMutex  sync.Mutex
 }
 
 // ProcessInfo stores information about a single process
@@ -94,6 +97,7 @@ func NewProcessCollector(topN, cacheTime int) *ProcessCollector {
 			"User CPU time by process",
 			[]string{"pid", "name", "user"}, nil,
 		),
+		collecting: false,
 	}
 }
 
@@ -117,46 +121,41 @@ func (c *ProcessCollector) Collect(ch chan<- prometheus.Metric) {
 		c.mutex.RUnlock()
 		// Use cached data
 		for _, p := range processes {
-			pid := strconv.Itoa(int(p.PID))
-			now := time.Now().Unix()
-			uptime := float64(now - p.CreateTime)
-			
-			ch <- prometheus.MustNewConstMetric(c.cpuDesc, prometheus.GaugeValue, p.CpuPercent, pid, p.Name, p.Username)
-			ch <- prometheus.MustNewConstMetric(c.memPercDesc, prometheus.GaugeValue, float64(p.MemPercent), pid, p.Name, p.Username)
-			ch <- prometheus.MustNewConstMetric(c.memBytesDesc, prometheus.GaugeValue, float64(p.MemBytes), pid, p.Name, p.Username)
-			ch <- prometheus.MustNewConstMetric(c.threadDesc, prometheus.GaugeValue, float64(p.ThreadCount), pid, p.Name, p.Username)
-			ch <- prometheus.MustNewConstMetric(c.uptimeDesc, prometheus.GaugeValue, uptime, pid, p.Name, p.Username)
-			ch <- prometheus.MustNewConstMetric(c.cpuSystemDesc, prometheus.CounterValue, p.CpuSystemTime, pid, p.Name, p.Username)
-			ch <- prometheus.MustNewConstMetric(c.cpuUserDesc, prometheus.CounterValue, p.CpuUserTime, pid, p.Name, p.Username)
+			c.emitProcessMetrics(ch, p)
 		}
 		return
 	}
 	c.mutex.RUnlock()
 
-	// We need to refresh data
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-	// Double-check if cache is still invalid (in case another goroutine updated it while we were waiting for the lock)
-	if !c.lastCollect.IsZero() && time.Since(c.lastCollect).Seconds() < float64(c.cacheTime) {
+	// Try to acquire the collection lock - if another goroutine is already collecting, use existing data
+	if !c.collectMutex.TryLock() {
+		c.mutex.RLock()
 		processes := c.processes
-		// Use cached data
+		c.mutex.RUnlock()
+		log.Println("Another collection in progress, using cached data")
 		for _, p := range processes {
-			pid := strconv.Itoa(int(p.PID))
-			now := time.Now().Unix()
-			uptime := float64(now - p.CreateTime)
-			
-			ch <- prometheus.MustNewConstMetric(c.cpuDesc, prometheus.GaugeValue, p.CpuPercent, pid, p.Name, p.Username)
-			ch <- prometheus.MustNewConstMetric(c.memPercDesc, prometheus.GaugeValue, float64(p.MemPercent), pid, p.Name, p.Username)
-			ch <- prometheus.MustNewConstMetric(c.memBytesDesc, prometheus.GaugeValue, float64(p.MemBytes), pid, p.Name, p.Username)
-			ch <- prometheus.MustNewConstMetric(c.threadDesc, prometheus.GaugeValue, float64(p.ThreadCount), pid, p.Name, p.Username)
-			ch <- prometheus.MustNewConstMetric(c.uptimeDesc, prometheus.GaugeValue, uptime, pid, p.Name, p.Username)
-			ch <- prometheus.MustNewConstMetric(c.cpuSystemDesc, prometheus.CounterValue, p.CpuSystemTime, pid, p.Name, p.Username)
-			ch <- prometheus.MustNewConstMetric(c.cpuUserDesc, prometheus.CounterValue, p.CpuUserTime, pid, p.Name, p.Username)
+			c.emitProcessMetrics(ch, p)
 		}
 		return
 	}
+	defer c.collectMutex.Unlock()
+
+	// We need to refresh data
+	c.mutex.Lock()
+	// Double-check if cache is still invalid (in case another goroutine updated it while we were waiting for the lock)
+	if !c.lastCollect.IsZero() && time.Since(c.lastCollect).Seconds() < float64(c.cacheTime) {
+		processes := c.processes
+		c.mutex.Unlock()
+		// Use cached data
+		for _, p := range processes {
+			c.emitProcessMetrics(ch, p)
+		}
+		return
+	}
+	c.mutex.Unlock()
 
 	log.Println("Collecting process metrics...")
+	
 	// Get all processes
 	processes, err := process.Processes()
 	if err != nil {
@@ -164,42 +163,88 @@ func (c *ProcessCollector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
-	// First call to initialize CPU percentage
+	// First pass: quick filter by CPU to reduce workload
+	// This gives a rough estimate to filter out processes not worth examining in detail
+	prelimProcesses := make([]*process.Process, 0, len(processes))
 	for _, p := range processes {
-		_, _ = p.CPUPercent()
+		cpuPercent, err := p.CPUPercent()
+		if err == nil && cpuPercent > 0.1 { // Only consider processes with non-negligible CPU
+			prelimProcesses = append(prelimProcesses, p)
+		}
 	}
 
-	// Short delay for CPU metrics to be accurate
-	time.Sleep(100 * time.Millisecond)
+	// Sort by preliminary CPU usage to focus on likely top processes
+	sort.Slice(prelimProcesses, func(i, j int) bool {
+		cpu1, _ := prelimProcesses[i].CPUPercent()
+		cpu2, _ := prelimProcesses[j].CPUPercent()
+		return cpu1 > cpu2
+	})
 
-	// Collect detailed data
+	// Take a reasonable number to process in detail (2x topN to ensure we don't miss any)
+	candidateCount := c.topN * 2
+	if len(prelimProcesses) > candidateCount {
+		prelimProcesses = prelimProcesses[:candidateCount]
+	}
+
+	// Collect detailed data for filtered processes in parallel
+	processChan := make(chan ProcessInfo, len(prelimProcesses))
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, 5) // Reduced from 10 to 5 to limit concurrency
+
+	for _, p := range prelimProcesses {
+		wg.Add(1)
+		semaphore <- struct{}{} // Acquire semaphore
+		go func(proc *process.Process) {
+			defer wg.Done()
+			defer func() { <-semaphore }() // Release semaphore
+			
+			info, err := getProcessInfo(proc)
+			if err != nil {
+				return
+			}
+			processChan <- info
+		}(p)
+	}
+
+	// Close channel when all goroutines are done
+	go func() {
+		wg.Wait()
+		close(processChan)
+	}()
+
+	// Collect results
 	var processInfoList []ProcessInfo
-	for _, p := range processes {
-		info, err := getProcessInfo(p)
-		if err != nil {
-			continue
-		}
+	for info := range processChan {
 		processInfoList = append(processInfoList, info)
 	}
 
 	// Store top N processes by CPU and memory
-	c.processes = getTopProcesses(processInfoList, c.topN)
+	topProcesses := getTopProcesses(processInfoList, c.topN)
+	
+	c.mutex.Lock()
+	c.processes = topProcesses
 	c.lastCollect = time.Now()
+	c.mutex.Unlock()
 
 	// Emit metrics
-	for _, p := range c.processes {
-		pid := strconv.Itoa(int(p.PID))
-		now := time.Now().Unix()
-		uptime := float64(now - p.CreateTime)
-		
-		ch <- prometheus.MustNewConstMetric(c.cpuDesc, prometheus.GaugeValue, p.CpuPercent, pid, p.Name, p.Username)
-		ch <- prometheus.MustNewConstMetric(c.memPercDesc, prometheus.GaugeValue, float64(p.MemPercent), pid, p.Name, p.Username)
-		ch <- prometheus.MustNewConstMetric(c.memBytesDesc, prometheus.GaugeValue, float64(p.MemBytes), pid, p.Name, p.Username)
-		ch <- prometheus.MustNewConstMetric(c.threadDesc, prometheus.GaugeValue, float64(p.ThreadCount), pid, p.Name, p.Username)
-		ch <- prometheus.MustNewConstMetric(c.uptimeDesc, prometheus.GaugeValue, uptime, pid, p.Name, p.Username)
-		ch <- prometheus.MustNewConstMetric(c.cpuSystemDesc, prometheus.CounterValue, p.CpuSystemTime, pid, p.Name, p.Username)
-		ch <- prometheus.MustNewConstMetric(c.cpuUserDesc, prometheus.CounterValue, p.CpuUserTime, pid, p.Name, p.Username)
+	for _, p := range topProcesses {
+		c.emitProcessMetrics(ch, p)
 	}
+}
+
+// Helper method to emit metrics for a process
+func (c *ProcessCollector) emitProcessMetrics(ch chan<- prometheus.Metric, p ProcessInfo) {
+	pid := strconv.Itoa(int(p.PID))
+	now := time.Now().Unix()
+	uptime := float64(now - p.CreateTime)
+	
+	ch <- prometheus.MustNewConstMetric(c.cpuDesc, prometheus.GaugeValue, p.CpuPercent, pid, p.Name, p.Username)
+	ch <- prometheus.MustNewConstMetric(c.memPercDesc, prometheus.GaugeValue, float64(p.MemPercent), pid, p.Name, p.Username)
+	ch <- prometheus.MustNewConstMetric(c.memBytesDesc, prometheus.GaugeValue, float64(p.MemBytes), pid, p.Name, p.Username)
+	ch <- prometheus.MustNewConstMetric(c.threadDesc, prometheus.GaugeValue, float64(p.ThreadCount), pid, p.Name, p.Username)
+	ch <- prometheus.MustNewConstMetric(c.uptimeDesc, prometheus.GaugeValue, uptime, pid, p.Name, p.Username)
+	ch <- prometheus.MustNewConstMetric(c.cpuSystemDesc, prometheus.CounterValue, p.CpuSystemTime, pid, p.Name, p.Username)
+	ch <- prometheus.MustNewConstMetric(c.cpuUserDesc, prometheus.CounterValue, p.CpuUserTime, pid, p.Name, p.Username)
 }
 
 // Get information about a process
@@ -248,62 +293,35 @@ func getProcessInfo(p *process.Process) (ProcessInfo, error) {
 		info.ThreadCount = numThreads
 	}
 
-	// Creation time
+	// Create time
 	createTime, err := p.CreateTime()
 	if err == nil {
 		info.CreateTime = createTime / 1000 // Convert to seconds
 	}
 
 	// CPU times
-	times, err := p.Times()
+	cpuTimes, err := p.Times()
 	if err == nil {
-		info.CpuUserTime = times.User
-		info.CpuSystemTime = times.System
+		info.CpuUserTime = cpuTimes.User
+		info.CpuSystemTime = cpuTimes.System
 	}
 
 	return info, nil
 }
 
-// Get top N processes by CPU and Memory
-func getTopProcesses(processes []ProcessInfo, n int) []ProcessInfo {
-	if len(processes) == 0 {
-		return []ProcessInfo{}
-	}
-
-	// Sort by CPU (descending)
+// Get top N processes by CPU and memory
+func getTopProcesses(processes []ProcessInfo, topN int) []ProcessInfo {
+	// Sort by CPU percentage
 	sort.Slice(processes, func(i, j int) bool {
 		return processes[i].CpuPercent > processes[j].CpuPercent
 	})
 
-	// Get top N by CPU
-	topCPU := make([]ProcessInfo, 0, n)
-	for i := 0; i < n && i < len(processes); i++ {
-		topCPU = append(topCPU, processes[i])
+	// Take top N processes
+	if len(processes) > topN {
+		processes = processes[:topN]
 	}
 
-	// Sort by Memory (descending)
-	sort.Slice(processes, func(i, j int) bool {
-		return processes[i].MemPercent > processes[j].MemPercent
-	})
-
-	// Get top N by Memory
-	topMemory := make([]ProcessInfo, 0, n)
-	for i := 0; i < n && i < len(processes); i++ {
-		// Check if process is already in topCPU
-		found := false
-		for _, p := range topCPU {
-			if p.PID == processes[i].PID {
-				found = true
-				break
-			}
-		}
-		if !found {
-			topMemory = append(topMemory, processes[i])
-		}
-	}
-
-	// Combine lists
-	return append(topCPU, topMemory...)
+	return processes
 }
 
 // Health check handler
@@ -343,10 +361,11 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
     <ul>
         <li>TOP_N: %d</li>
         <li>CACHE_SECONDS: %d</li>
+        <li>MAX_CONCURRENT: %d</li>
     </ul>
 </body>
 </html>`
-	fmt.Fprintf(w, html, config.TopN, config.CacheTime)
+	fmt.Fprintf(w, html, config.TopN, config.CacheTime, config.MaxConcurrent)
 }
 
 // Get environment variable or default
@@ -366,6 +385,7 @@ func main() {
 	flag.IntVar(&config.TopN, "topn", 0, "Number of top processes to report")
 	flag.IntVar(&config.CacheTime, "cache", 0, "Seconds to cache results")
 	flag.StringVar(&config.MetricsPath, "metrics-path", "", "Path to expose metrics on")
+	flag.IntVar(&config.MaxConcurrent, "max-concurrent", 0, "Maximum concurrent metrics scrapes")
 	flag.Parse()
 
 	// Read environment variables (with precedence over command-line flags)
@@ -377,19 +397,27 @@ func main() {
 		}
 	}
 
-	if topNStr := getEnvOrDefault("TOP_N", "100"); config.TopN == 0 {
+	if topNStr := getEnvOrDefault("TOP_N", "30"); config.TopN == 0 {
 		if topN, err := strconv.Atoi(topNStr); err == nil {
 			config.TopN = topN
 		} else {
-			config.TopN = 100
+			config.TopN = 30
 		}
 	}
 
-	if cacheStr := getEnvOrDefault("CACHE_SECONDS", "10"); config.CacheTime == 0 {
+	if cacheStr := getEnvOrDefault("CACHE_SECONDS", "20"); config.CacheTime == 0 {
 		if cache, err := strconv.Atoi(cacheStr); err == nil {
 			config.CacheTime = cache
 		} else {
-			config.CacheTime = 10
+			config.CacheTime = 20
+		}
+	}
+
+	if maxConcurrentStr := getEnvOrDefault("MAX_CONCURRENT", "2"); config.MaxConcurrent == 0 {
+		if maxConcurrent, err := strconv.Atoi(maxConcurrentStr); err == nil {
+			config.MaxConcurrent = maxConcurrent
+		} else {
+			config.MaxConcurrent = 2
 		}
 	}
 
@@ -404,13 +432,22 @@ func main() {
 	prometheus.MustRegister(collector)
 
 	// Register handlers
-	http.Handle(config.MetricsPath, promhttp.Handler())
+	http.Handle(config.MetricsPath, promhttp.InstrumentMetricHandler(
+		prometheus.DefaultRegisterer, promhttp.HandlerFor(
+			prometheus.DefaultGatherer,
+			promhttp.HandlerOpts{
+				MaxRequestsInFlight: config.MaxConcurrent,
+				Timeout:            60 * time.Second,
+			},
+		),
+	))
 	http.HandleFunc("/health", healthHandler)
 	http.HandleFunc("/", rootHandler)
 
 	// Start server
 	addr := fmt.Sprintf(":%d", config.Port)
-	log.Printf("Starting Top Process Exporter (TOP_N=%d, CACHE_SECONDS=%d)", config.TopN, config.CacheTime)
+	log.Printf("Starting Top Process Exporter (TOP_N=%d, CACHE_SECONDS=%d, MAX_CONCURRENT=%d)", 
+		config.TopN, config.CacheTime, config.MaxConcurrent)
 	log.Printf("Metrics available at http://0.0.0.0:%d%s", config.Port, config.MetricsPath)
 	log.Fatal(http.ListenAndServe(addr, nil))
 } 

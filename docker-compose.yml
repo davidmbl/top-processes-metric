@@ -11,8 +11,8 @@ services:
     ports:
       - "9258:8000"
     environment:
-      - TOP_N=100
-      - CACHE_SECONDS=10
+      - TOP_N=30
+      - CACHE_SECONDS=20
     # Host process access
     pid: host
     privileged: true

@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.22-alpine AS builder
+FROM golang:1.21-alpine AS builder
 
 # Install build dependencies
 RUN apk add --no-cache git
@@ -9,10 +9,10 @@ WORKDIR /app
 # Copy go module files and source code
 COPY go.mod main.go ./
 
-# Get dependencies and build
+# Get dependencies and build with specific flags
 RUN go mod tidy && \
     go get -d -v && \
-    go build -o top-process-exporter .
+    CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o top-process-exporter .
 
 # Final stage
 FROM alpine:latest
@@ -38,9 +38,10 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
   CMD wget --no-verbose --tries=1 --spider http://localhost:8000/health || exit 1
 
 # Default environment variables
-ENV TOP_N=100
-ENV CACHE_SECONDS=10
+ENV TOP_N=30
+ENV CACHE_SECONDS=20
 ENV PORT=8000
+ENV MAX_CONCURRENT=2
 
 # Run the application
 CMD ["./top-process-exporter"] 
